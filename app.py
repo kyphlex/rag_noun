@@ -1,91 +1,80 @@
-import os
 import streamlit as st
-from google import genai
-from google.genai import types
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+import os
 
-# Page Config
-st.set_page_config(page_title="Gemini PDF Assistant", layout="centered")
-st.title("📄 Gemini PDF RAG Assistant")
+# Set up the Streamlit page configuration
+st.set_page_config(page_title="PDF RAG App", page_icon="📚", layout="centered")
 
-# API Key handling
-if "GEMINI_API_KEY" in st.secrets:
-  os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+st.title("📚 Course Material Q&A App")
+st.write("Upload a PDF of your course materials and ask questions about the content.")
+
+# Sidebar for API Key and File Upload
+with st.sidebar:
+    st.header("Configuration")
+    api_key = st.text_input("Enter your Google Gemini API Key:", type="password")
+    
+    st.header("Document Upload")
+    uploaded_file = st.file_uploader("Upload your PDF file", type=["pdf"])
+
+# Ensure the API key is provided before proceeding
+if api_key:
+    # Set the API key as an environment variable for LangChain to pick up
+    os.environ["GOOGLE_API_KEY"] = api_key
+
+    # Check if a file has been uploaded
+    if uploaded_file is not None:
+        # Step 1: Read the PDF
+        # We process the PDF only if it hasn't been processed in the current session
+        if "vector_store" not in st.session_state:
+            with st.spinner("Reading and processing the PDF..."):
+                pdf_reader = PdfReader(uploaded_file)
+                raw_text = ""
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        raw_text += text
+                
+                # Step 2: Split the text into chunks
+                # We use overlap to ensure context isn't lost between chunks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                    length_function=len
+                )
+                chunks = text_splitter.split_text(raw_text)
+                
+                # Step 3: Create embeddings and store in FAISS
+                embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+                vector_store = FAISS.from_texts(chunks, embeddings)
+                
+                # Save the vector store in session state so it persists during interaction
+                st.session_state.vector_store = vector_store
+                st.success("PDF processed successfully! You can now ask questions.")
+
+        # Step 4: Setup the QA Interface
+        st.subheader("Ask a Question")
+        user_question = st.text_input("What would you like to know about the course material?")
+        
+        if user_question:
+            with st.spinner("Generating answer..."):
+                # Initialize the Gemini model
+                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
+                
+                # Create a retrieval chain using the vector store from session state
+                retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=llm,
+                    chain_type="stuff", # "stuff" stuffs all retrieved chunks into the prompt
+                    retriever=retriever
+                )
+                
+                # Run the chain and display the answer
+                response = qa_chain.invoke(user_question)
+                st.write("**Answer:**")
+                st.write(response["result"])
 else:
-  api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
-  if api_key:
-    os.environ["GEMINI_API_KEY"] = api_key
-
-# File Uploader (Max 10MB constraint)
-uploaded_file = st.file_uploader("Upload a PDF file (max 10MB)", type=["pdf"])
-
-if uploaded_file is not None:
-  if uploaded_file.size > 10 * 1024 * 1024:
-    st.error("File size exceeds 10MB limit. Please upload a smaller file.")
-  else:
-    temp_file_path = f"temp_{uploaded_file.name}"
-    with open(temp_file_path, "wb") as f:
-      f.write(uploaded_file.getbuffer())
-
-    if not os.environ.get("GEMINI_API_KEY"):
-      st.warning("Please enter your Gemini API key in the sidebar to proceed.")
-    else:
-      # Initialize client and persistent chat session safely
-      if "file_name" not in st.session_state or st.session_state.file_name != uploaded_file.name:
-        with st.spinner("Uploading and processing PDF with Gemini..."):
-          # Create client instance
-          client = genai.Client()
-          
-          # Upload file
-          gemini_file = client.files.upload(file=temp_file_path)
-          
-          # Initialize chat session
-          chat = client.chats.create(
-              model="gemini-2.5-flash",
-              config=types.GenerateContentConfig(
-                  system_instruction=(
-                      "You are a helpful assistant specialized in analyzing "
-                      "the provided PDF document. Answer questions accurately "
-                      "based strictly on the document's content."
-                  )
-              ),
-          )
-          
-          # Store state persistently
-          st.session_state.uploaded_gemini_file = gemini_file
-          st.session_state.chat = chat
-          st.session_state.file_name = uploaded_file.name
-          st.success("PDF ready! You can now ask questions below.")
-
-      # Chat Interface State
-      if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-      for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-          st.markdown(message["content"])
-
-      if user_query := st.chat_input("Ask something about the PDF..."):
-        st.session_state.messages.append(
-            {"role": "user", "content": user_query}
-        )
-        with st.chat_message("user"):
-          st.markdown(user_query)
-
-        with st.chat_message("assistant"):
-          with st.spinner("Thinking..."):
-            try:
-              # Send message using the saved chat session
-              response = st.session_state.chat.send_message([
-                  st.session_state.uploaded_gemini_file,
-                  user_query,
-              ])
-              answer = response.text
-              st.markdown(answer)
-              st.session_state.messages.append(
-                  {"role": "assistant", "content": answer}
-              )
-            except Exception as e:
-              st.error(f"Error communicating with Gemini: {e}")
-
-    if os.path.exists(temp_file_path):
-      os.remove(temp_file_path)
+    st.info("Please enter your Google Gemini API Key in the sidebar to get started.")
